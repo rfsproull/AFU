@@ -136,7 +136,7 @@ AFU does not handle .dsk300 images.  Use the Alto program TFU to work
 with these.  TFU will transfer files between .dsk300 and .dsk80
 images, which AFU can handle.
 
-IMPLEMENTATIONS NOTES
+IMPLEMENTATION NOTES
 
 The implementation of AFU is intended to be simple, not efficient.
 Because Alto files are small by today's standards, AFU's speed is
@@ -148,6 +148,9 @@ file-transfer application.  The library is used for other programs,
 e.g., pressbits2ps, which reads portions of a large Trident file
 holding a printer page image and creates a Postscript file for viewing
 on the host computer.
+
+The implementation is designed to work with Python 2 and 3.  Tested
+mostly on 2.7 on Mac OS 10.11.
 
 
 
