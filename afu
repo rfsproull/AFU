@@ -1,0 +1,503 @@
+#!/usr/bin/env python
+
+# Bob Sproull  4/2018   rfsproull@gmail.com
+
+# Alto File Utility (afu)
+# Read/write .dsk files representing Diablo (31,44) and Trident (80,300) disks
+
+# On Unix, Mac, etc. can name the file afu and 'chmod ugo+x afu' so
+# that you can simply say 'afu' to run it.
+
+# Can be run as "python -i afu" so that you land in the interpreter and can
+# call whatever functions you want.
+
+from altofs import *
+
+import os, sys
+
+## ********************************************************************************************************
+##        CLASS SWATEE
+## ********************************************************************************************************
+
+DASTART = 0o420
+DCB_next = 0     # pointer to next DCB
+DCB_control = 1  # resolution(1), color(1), htab(6), nwrds(8)
+DCB_SA = 2       # bit map start address
+DCB_SLC = 3      # height*2 in scan-lines
+
+CURMAP = 0o431   # start of 16-word cursor bit map
+CURLOC = 0o426   # two words: x, y (from top)   x<0 means no cursor
+
+PNG_INVERT = 1   # black=0 in a PNG file
+
+class Swatee:
+
+    def __init__(self, file_system):
+        self.file_system = file_system
+        self.swatee = file_system.file("Swatee.")
+        if self.swatee is None:
+            raise Exception("No Swatee file on the disk.")
+
+    def examine(self, addr):
+        # Compute file index based on format of boot files (doc in Alto Subsystems, Boot file, S-file)
+        fi = -1
+        if 0o1000 <= addr <= 0o176777:
+            fi = (1 * 256) + (addr - 0o1000)
+        if 0o400 <= addr <= 0o777:
+            fi = (253 * 256) + (addr - 0o400)
+        if 0 <= addr <= 0o377:
+            fi = (254 * 256) + addr
+        if fi == -1:
+            raise Exception("Bad memory address to Swatee.examine")
+        return self.swatee.get_word(fi)
+
+    # return dict with entries
+    def parse_DCB(self, addr):
+        a = {'next' : self.examine(addr+DCB_next), 'SA': self.examine(addr+DCB_SA), 'SLC': self.examine(addr+DCB_SLC) }
+        w = self.examine(addr+DCB_control)
+        a ['resolution'] = 'high' if (w & 0o100000)==0 else 'low'
+        a ['invert'] = 0 if (w & 0o100000)==0 else 1
+        a ['htab'] = (w >> 8) & 0o77
+        a ['nwrds'] = w & 0o377
+        # no image if nwrds = 0
+        a ['blank'] = True if a['nwrds'] == 0 else False
+        return a
+
+    # compute image size
+    def get_image_size(self):
+        dcb_addr = self.examine(DASTART)
+        y_current = 0
+        x_min,x_max = 1000,0  # max is 1 beyond
+        y_min,y_max = 1000,0  # note: y's measured from top of screen
+        while dcb_addr != 0:
+            dcb = self.parse_DCB(dcb_addr)
+            #prr("DCB at y=", y_current, ":", dcb)
+            if not dcb['blank']:
+                if dcb['htab']*16 < x_min: x_min = dcb['htab']*16
+                if (dcb['htab']+dcb['nwrds'])*16 > x_max: x_max = (dcb['htab']+dcb['nwrds'])*16
+                if y_current < y_min: y_min = y_current
+                if y_current+dcb['SLC']*2 > y_max: y_max = y_current+dcb['SLC']*2
+            y_current += dcb['SLC']*2
+            dcb_addr = dcb['next']
+        return { 'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max }
+
+    # return a single scanline of bits in format needed by PNG writer
+    # note that Alto display line may be shorter than image size requires
+    # y is measured relative to the top of the dcb; y_top where the dcb starts
+    # handles 'blank' DCBs in order to get cursor processing right
+    def get_scanline_bits(self, y, dcb_props, y_top, image_size):
+        scan_line_start = dcb_props['SA'] + y*dcb_props['nwrds']
+        invert = dcb_props['invert'] ^ PNG_INVERT
+        sl_vals = []   # row of integers!
+        for x in range(image_size['x_min'], dcb_props['htab']*16):
+            sl_vals.append(invert)
+        for x in range(0, dcb_props['nwrds']*16):
+            bit_word = self.examine(scan_line_start + x // 16)
+            bit_val = (bit_word >> (15 - x % 16)) & 1
+            sl_vals.append(invert ^ bit_val)
+        for x in range(image_size['x_min']+dcb_props['htab']*16+dcb_props['nwrds']*16, image_size['x_max']):
+            sl_vals.append(invert)
+        # now add in cursor bits, if in range
+        cursor_x, cursor_y = SignExtend16(self.examine(CURLOC)), self.examine(CURLOC+1)
+        if cursor_x >= 0 and cursor_y <= y_top + y < cursor_y+16:
+            # cursor visible on this scan-line
+            prr("Cursor visible", y_top+y, cursor_x, cursor_y)
+            cursor_word = self.examine(CURMAP + y_top + y - cursor_y)
+            for xi in range(16):
+                if (cursor_word & 0o100000) != 0:  # cursor bit set
+                    x = xi + cursor_x
+                    if image_size['x_min'] <= x < image_size['x_max']:
+                        # set corresdponding bit in scan-line to 'invert' -- same polarity as DCB
+                        sl_vals[x - image_size['x_min']] = invert
+                cursor_word = cursor_word << 1
+        return sl_vals
+
+    # create two-dimensional array of boxed pixel values for PNG writer
+    def get_screen_bits(self):
+        image_size = self.get_image_size()
+        dcb_addr = self.examine(DASTART)
+        lines = []
+        y_top = 0
+        while dcb_addr != 0:
+            dp = self.parse_DCB(dcb_addr)
+            if False: # Write out a file with the bits from the (only) DCB -- debugging Press Print to screen
+                f = open("AFU.octal","wb")
+                prr("Writing AFU.octal ",dp)
+                for y in range(dp['SLC']*2):
+                    scan_line_start = dp['SA'] + y*dp['nwrds']
+                    for wrd in range(0, dp['nwrds']):
+                        bit_word = self.examine(scan_line_start + wrd)
+                        #if bit_word != 0: print y,wrd,bit_word
+                        ba = bytearray(2)
+                        ba[0] = (bit_word >> 8)
+                        ba[1] = (bit_word & 0o377)
+                        f.write(ba)
+                f.close()
+            if image_size['y_min'] <= y_top < image_size['y_max']:
+                # must put out scan-lines for this DCB, but it might be blank
+                for y in range(dp['SLC']*2):
+                    sl_vals = self.get_scanline_bits(y, dp, y_top, image_size)
+                    lines.append(sl_vals)
+            y_top += dp['SLC']*2
+            dcb_addr = dp['next']
+        return lines
+
+    # write a .png file
+    def screen_scrape(self, fn=""):
+        if self.file_system.swatee is None:
+            prr("No file 'Swatee' from which to get screen contents.")
+            return
+        if fn == '':
+            fn = file_system.disk.fullfilename + ".png"
+        # import png only if you're trying to create an image file of the swatee screen
+        # if you don't have png, try "pip install pypng"
+        # see http://pythonhosted.org/pypng/index.html
+        s = self.get_screen_bits()
+        try:
+            import png
+            # very inefficient use of storage, but totally portable...
+            f = open(fn, "wb")
+            w = png.Writer(len(s[0]), len(s), greyscale=True, bitdepth=1)
+            w.write(f, s)
+            f.close()
+        except Exception as e:
+            prr("Exception in capturing Swatee screen. Perhaps you need to do 'pip install pypng'")
+            return
+
+
+## ********************************************************************************************************
+##        TRANSFER FILES TO/FROM ALTO
+## ********************************************************************************************************
+
+# We need to distinguish text and binary files for processing:
+#  text:  CR on Alto, LF on host (Mac convention)
+# In arguments, if ftype="Auto", file is inspected and processed accordingly.  Otherwise,
+#     ftype='Text...' or ftype='Binary'
+# Filenames are given as you want them on the host; all converted to lower case for matching on Alto
+#    and a "." is added to the end for the Alto name
+
+# figure out file type from file bytes or bytearray chars
+def get_type(file_or_array):
+    is_file = isinstance(file_or_array, File)
+    nChars = file_or_array.length if is_file else len(file_or_array)
+    cr_count = 0
+    lf_count = 0
+    cr_lf_count = 0
+    CR_previous = False
+    for i in range(nChars):
+        ch = (file_or_array.get_byte(i) if is_file else file_or_array[i])
+        if ch == 0 or ch > 0o177: return 'Binary'
+        # in ASCII range; determine line end convention
+        if ch == CR:
+            cr_count += 1
+            CR_previous = True
+        else:
+            if ch == LF:
+                lf_count += 1
+                if CR_previous: cr_lf_count += 1
+            CR_previous = False
+    if cr_lf_count != 0: return 'Text-CRLF'
+    if lf_count != 0: return 'Text-LF'
+    if cr_count != 0: return 'Text-CR'
+    # if file is empty
+    return 'Binary'
+
+def convert_text_type(s, from_type, to_type):
+    prr("Convert from", from_type, "to", to_type)
+    if from_type == to_type: return s
+    fr_ch = {'Text-CR':CR, 'Text-LF':LF, 'Text-CRLF':CR}[from_type]
+    fr_next = (from_type == 'Text-CRLF')
+    to_ch = {'Text-CR':CR, 'Text-LF':LF, 'Text-CRLF':CR}[to_type]
+    to_next = (to_type == 'Text-CRLF')
+    pass_up = False
+    so = bytearray()
+    for ch in s:
+        if pass_up:
+            pass_up = False
+            continue
+        if ch == fr_ch:
+            if fr_next: pass_up = True  # bypass lf
+            so.append(to_ch)
+            if to_next: so.append(LF)
+        else:
+            so.append(ch)
+    return so
+
+# Transfer file from host to Alto
+def file_to_alto(fn, ftype="Auto", host_file_name=""):
+    if host_file_name == "": host_file_name = fn
+    fn = os.path.split(fn)[1]   # Alto name is just basename
+    if not os.path.exists(host_file_name):
+        raise Exception("Cannot find host file "+host_file_name)
+    #prr("file_to_alto:", fqfn, ftype)
+
+    # P2/P3 difference in reading binary streams
+    with open(host_file_name,"rb") as f:
+        s = bytearray(f.read())
+        f.close()
+    # figure out source type
+    if ftype == 'Auto': ftype = get_type(s)
+    if ftype != 'Binary':
+        s = convert_text_type(s, ftype, 'Text-CR')  # to Alto
+    else:
+        # Binary files can have odd number of bytes, e.g. .dm files
+        #if len(s) % 2 == 1:
+        #    raise Exception("Binary file requires even number of bytes")
+        if False:      # old option to swap bytes
+            for i in range(0, len(s), 2):
+                b = s[i+1]
+                s[i+1] = s[i]
+                s[i] = b
+    # now delete file on Alto so new file will have the right length
+    file_system.delete_file(fn)
+    f = file_system.create_file(fn, len(s))
+    #prr("Create_file:",f)
+    f = File(fn, file_system)
+    #prr("File in which to store:",f)
+    a = f.file_vdas   # raise exception if not a legal file
+    for i in range(len(s)):
+        f.set_byte(i, s[i])
+    return True
+
+# Read a file from the Alto.  Option to simply return the "string"
+# File name should NOT have a final "."
+def file_from_alto(fn, ftype="Auto", host_file_name="", returnIt=False):
+    if host_file_name == "": host_file_name = fn
+    fn = os.path.split(fn)[1]   # Alto name is just basename
+    f = File(fn, file_system)
+    if not f.exists():
+        raise Exception("Alto file not found: "+fn)
+    nChars = f.length
+    #prr("Reading nChars",nChars)
+    s = bytearray()
+    for i in range(nChars):
+        s.append(f.get_byte(i))
+    # figure out source type
+    if ftype == 'Auto': ftype = get_type(s)
+    if ftype != 'Binary':
+        s = convert_text_type(s, ftype, get_host_text_type())  # to host
+    else:
+        if len(s) % 2 == 1:
+            raise Exception("Binary file requires even number of bytes")
+        if False:     # old option to swap bytes
+            for i in range(0, len(s), 2):
+                b = s[i+1]
+                s[i+1] = s[i]
+                s[i] = b
+    if returnIt: return s
+
+    with open(host_file_name, "wb") as fh:
+        fh.write(s)
+        fh.close()
+
+# Read SysDir and write on host disk
+# Defaults to record on dsk/ with the name dsk.directory
+def directory_from_alto(fn, long=False, returnIt=False):
+    if fn == "": fn = file_system.disk.fullfilename + ".directory"
+    form = string.Formatter()
+    files = file_system.directory.list()
+    files_s = ""
+    for fil in files:
+        if long:
+            f = File(fil['leader_vda'], file_system)
+            fil['length'] = f.length
+            fil['type'] = get_type(f)
+        ps = form.format("{0:<25s} length {1:>9d}  {2:<6s}\n", fil['name'], fil['length'], fil['type'])
+        files_s += ps
+    if returnIt: return files_s
+    with open(fn,"w") as f:
+        f.write(files_s)
+        f.close()
+
+
+## ********************************************************************************************************
+##              AFU program
+## ********************************************************************************************************
+
+
+HELP_STRING='''AFU -- transfer files between host and an Alto disk (.dsk file)
+    afu [disk-image] [free | ls | directory | screen | help]
+    afu [disk-image] delete alto-file*
+    afu [disk-image] [type [auto|binary|text-*]]
+    	[toalto | fromalto ] file*
+    afu [disk-image] [type [auto|binary|text-*]]
+    	[toalto-rename | fromalto-rename] alto-file host-file
+
+The disk-image filename must appear first, with extension .dsk or .dsk80
+
+The following commands can appear sequentially on the command line:
+    help                               Print this message
+    free                               Print number of free pages
+    ls                                 Print directory
+    directory                          Write Alto directory to <.dsk>.directory
+    screen                             Get image of screen at last entry to Swat
+    type Auto|Binary|Text-*            File type for transfer
+                                       File types are generally inferred from files being transferred
+              Text-CR                  Text file with EOL = carriage return (Alto)
+              Text-CRLF                Text file with EOL = CR LF (Windows)
+              Text-LF                  Text file with EOL = LF (Unix, Mac OS)
+                                       If a conversion is performed, its type is printed.
+                                       If no conversion is performed, AFU is silent.
+
+Following command sequences may follow the commands above:
+    delete <alto_file_name>*
+    toalto <host_file_name>*
+       Transfer file from host to Alto dsk
+       Alto file name will be <host_file_name>, stripped on any leading directory path
+    fromalto <Alto_file_name>*
+       Transfer file from Alto dsk to host
+    toalto-rename <alto_file_name> <host_file_name>
+       Transfer file from host to Alto, using a different name
+    fromalto-rename <alto_file_name> <host_file_name>
+       Transfer file from Alto to host, using a different name
+
+Examples:
+    afu bcpl.dsk free toalto ~/bob/queens.bcpl
+         ...will print out the number of free pages on bcpl.dsk,
+         ...then read ~/bob/queens.bcpl from host, write queens.bcpl on bcpl.dsk
+
+If you set the environment variable AFUDSK to the name of the .dsk file you
+wish to use, there is no need to give the disk file name in the command line.
+'''
+
+disk_filename = "working.dsk"
+disk = None
+file_system = None
+
+def afu_strt():
+    global disk_filename, disk, file_system
+    if disk is not None: return
+    disk = Disk.select(disk_filename)
+    if disk is None:
+        raise Exception("File " + disk_filename + " not in a .dsk format.")
+    file_system = FileSystem(disk)
+
+def afu_do():
+    global disk_filename, disk, file_system
+# Look in environment for 'AFUDSK' variable (any capitalization) to specify .dsk name
+    env_key = None
+    for k in os.environ.keys():
+        if k.lower() == 'afudsk': env_key = k
+    if env_key is not None:
+        disk_filename = os.environ[env_key]
+
+    args = sys.argv[1:]
+    if len(args) > 0:
+        maybe_dsk = args[0]
+        sp = os.path.splitext(maybe_dsk)
+        if len(sp) == 2 and sp[1] in ('.dsk', '.dsk80'):
+            disk_filename = maybe_dsk
+            args  = args[1:]    # swallow argument
+
+    # Decode commands
+    ftype = 'Auto'   # file type
+    while len(args) != 0:
+        #try:
+        if True:
+            arg = args[0]
+            arg_lower = arg.lower()
+            # prefixes of arguments suffice
+            def match(cmd, match_len):
+                return len(arg_lower) >= match_len and cmd[0:match_len] == arg_lower[0:match_len]
+            # determine if command is of the form xxx-rename, or xxx-r for short
+            def is_rename():
+                s = arg_lower.split('-')
+                return len(s) > 1 and len(s[1]) > 0 and s[1][0] == 'r'
+
+            if match("help", 4):
+                pr(HELP_STRING)
+                args = args[1:]
+                continue
+            if match("type", 4):
+                xlate = {'auto':'Auto', 'binary':'Binary', 'text':'Text', 'text-cr':'Text-CR', 'text-lf':'Text-LF', 'text-crlf':'Text-CRLF'}
+                if arg_lower in xlate:
+                    ftype = xlate[arg_lower]
+                args = args[2:]
+                continue
+            if match("screen", 6):
+                afu_strt()
+                s = Swatee(file_system)
+                prr("Image size", s.get_image_size())
+                s.screen_scrape()
+                args = args[1:]
+                continue
+            if match("ls", 2):
+                afu_strt()
+                pr(directory_from_alto("", True, True))
+                args = args[1:]
+                continue
+            if match("directory", 9):
+                afu_strt()
+                directory_from_alto("", True, False)
+                args = args[1:]
+                continue
+            if match("free", 4):
+                afu_strt()
+                prr("There are", file_system.disk_descriptor.get_word(KDH_freePages), "free pages")
+                args = args[1:]
+                continue
+            if match("delete", 6):
+                afu_strt()
+                for idx in range(1,len(args)):
+                    res = file_system.delete_file(args[idx])
+                    if not res:
+                        prr("File not found to delete:", args[idx])
+                break
+            if (match("toalto", 6) or match("fromalto", 8)) and is_rename():
+                afu_strt()
+                if len(args) < 3:
+                    raise Exception("Command "+arg_lower+" requires two file names.")
+                # If "renaming", first argument is Alto file name, second is host file name
+                afn = args[1]
+                hfn = args[2]
+                if match("toalto", 6):
+                    prr("Copying [host]", hfn, "to [Alto]", afn, "[type]", ftype)
+                    file_to_alto(afn, ftype, hfn)
+                else:
+                    prr("Copying [Alto]", afn, "to [host]", hfn, "[type]", ftype)
+                    file_from_alto(afn, ftype, hfn)
+                break
+            if match("toalto", 6) or match("fromalto", 8):
+                afu_strt()
+                for idx in range(1,len(args)):
+                    afn = os.path.split(args[idx])[1]  # tail
+                    hfn = args[idx]
+                    if match("toalto", 6):
+                        prr("Copying [host]", hfn, "to [Alto]", afn, "[type]", ftype)
+                        file_to_alto(afn, ftype, hfn)
+                    else:
+                        prr("Copying [Alto]", afn, "to [host]", hfn, "[type]", ftype)
+                        file_from_alto(afn, ftype, hfn)
+                break
+
+            prr("Unknown command:", args[0], "Use 'AFU help' for command summary.")
+            exit(1)
+            # end of command loop
+#        except Exception as e:
+#            prr("Exception: ", e)
+     #      print_python_stack()
+#            exit(1)
+
+    if disk is not None: disk.write_disk()
+# end of afu_do()
+
+
+if False:           ######### TURN ON TO DEBUG #########
+
+# Good command to give while debugging:
+# python -i ndsk.py ls
+
+    d = Disk.select("working.dsk")
+    t = Disk.select("Press.t80")
+
+    d.print_sector(1)
+    t.print_sector(1)
+
+    #fsd = FileSystem(d)
+    fst = FileSystem(t)
+
+
+
+if __name__ == '__main__':
+    afu_do()
+
